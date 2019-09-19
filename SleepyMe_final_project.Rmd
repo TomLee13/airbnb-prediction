@@ -1,0 +1,713 @@
+---
+title: "Final Project: Airbnb New User Bookings Prediction"
+author: "Yangying Xu, Mingyang Li, Jun Zhang, Weijia Mi"
+date: "2018/12/8"
+output: html_document
+---
+##1. Introduction to data
+In train_user_2.csv  and test_users.csv  file, data provided a list of users along with some related information and statistics such as gender, language and signup flow. Sessions.csv file gives information about web sessions log for users. The column ¡®country_destination¡¯ in train file is the record of destination of each user and it is the target variable to predict in the test set. There are 12 possible outcomes of the destination countries: 'US', 'FR', 'CA', 'GB', 'ES', 'IT', 'PT', 'NL','DE', 'AU', 'NDF' (no destination found), and 'other'. Countries.csv also provides information about 10 country destination. All users in test file are new user and are from the USA, therefore, we are required to predict which country their first booking destination will be.  
+ 
+The training and test sets are split by dates. The training set includes users dataset dates back to 2010 and in the test set, all the new users are people with first activities after 7/1/2014 . The following part gives a detailed description of variables in files.
+
+File descriptions
+1.train_users.csv - the training set of users
+2.test_users.csv - the test set of users
+id: user id  £»  
+date_account_created: the date of account creation  £»  timestamp_first_active: timestamp of the first activity, note that it can be earlier than date_account_created or date_first_booking because a user can search before signing up  £»  
+date_first_booking: date of first booking  £»  
+gender  £»  
+age  £»  
+signup_method: Users can choose to register directly or log in with facebook or google account  £»  
+signup_flow: the page a user came to signup up from  £»  language: international language preference  £»  affiliate_channel: what kind of paid marketing   £»  affiliate_provider: where the marketing is e.g. google, craigslist, other  £»  
+first_affiliate_tracked: whats the first marketing the user interacted with before the signing up  £»  
+signup_app: users can choose web, andrew, ios or Moweb as media to browse information on Airbnb  £»  
+first_device_type: the phone or computer system that users use when they first browse Airbnb  £»  
+first_browser: the browser the user used when browsing Airbnb for the first time  £»  
+country_destination: this is the target variable you are to predict
+3.sessions.csv - web sessions log for users
+user_id: to be joined with the column 'id' in users table
+4.countries.csv - summary statistics of destination countries in this dataset and their locations
+5.age_gender_bkts.csv - summary statistics of users' age group, gender, country of destination
+
+
+##2. Business question 
+We want to use age, destination_language, id, gender, signup_method, language, affiliate_channel, affiliate_provider, signup_app, first_device_type and first_browserPredict variables to predict in which country a new Airbnb user will make his or her first booking.
+We are trying to find the best model to predict new Airbnb users' first booking.
+
+
+```{r setup, include=FALSE}
+# Import all libraries 
+library(tidyverse)
+library(tidymodels)
+library(DataExplorer)
+library(caret)
+library(plyr)
+library(dplyr)
+library(doParallel)
+library(randomForest)
+library(readr)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(xgboost)
+library(rpart)
+library(reshape2)
+library(RColorBrewer)
+```
+
+```{r import_data}
+# Import data 
+train_user <- read_csv("~/myfirstR/all/train_users_2.csv")
+countries <- read_csv("~/myfirstR/all/countries.csv")
+test_user <- read_csv("~/myfirstR/all/test_users.csv")
+
+# Transfrorm data frame into data table
+train_user <- as.data.table(train_user)
+countries <- as.data.table(countries)
+
+# Set key for joining for both tables
+setkey(train_user, country_destination)
+setkey(countries, country_destination)
+merged_user <- countries[train_user, on = "country_destination"]
+
+# Drop key
+setkey(train_user, NULL)
+setkey(countries, NULL)
+
+# Summarize data
+summary(train_user)
+
+```
+
+
+##3.Exploratory Data Analysis
+```{r,fig.height=10}
+# To get introduce to our dataset and visualize the table
+introduce(merged_user)
+plot_intro(merged_user)
+
+```
+
+As we can see from the introduction table, we have 213451 rows and 29 columns. 14.6% of observations are missing. Additionally, we find that some continous variables such as signup_flow should be factor, we will process these variables in the following part.
+
+```{r,fig.height=10}
+# Draw histograms to visualize frequency distributions for all continous variables
+plot_histogram(merged_user)
+
+```
+```{r,fig.height=10}
+# Draw bar charts to visualize frequency distributions for all discrete variables
+plot_bar(merged_user)
+```
+
+We can see that the date in our data table is composed of year, month and day. We want to see seasonal changes in registration and activation. So here we need to seperate year, month and day into different columns.
+
+```{r, split_date}
+# Split the date of date_account_created and timestamp_first_active
+merged_user$year_account_created <- year(merged_user$date_account_created)
+merged_user$month_account_created <- month(merged_user$date_account_created)
+merged_user$day_account_created <-day(merged_user$date_account_created)
+merged_user <- within(merged_user, year_month_account_created <- sprintf("%d-%02d", year_account_created, month_account_created))
+
+merged_user$year_first_active <- substr(merged_user$timestamp_first_active,1,4)
+merged_user$month_first_active <- substr(merged_user$timestamp_first_active,5,6)
+merged_user$day_first_active <- substr(merged_user$timestamp_first_active,7,8)
+merged_user$date_first_active <- substr(merged_user$timestamp_first_active,1,8)
+merged_user$date_first_active <-ymd(merged_user$date_first_active)
+merged_user <- within(merged_user, year_month_first_active <- sprintf("%s-%02s", year_first_active, month_first_active))
+
+merged_user$timestamp_first_active <-NULL
+```
+
+```{r, delete_colum}
+# Delete the date_first_booking colunm
+merged_user$date_first_booking <- NULL
+```
+
+```{r,fig.height=10}
+# Make plot of sensonal first active
+merged_user_group1 <- merged_user %>%
+  group_by(year_month_first_active, year_first_active, month_first_active) %>%
+  dplyr::summarise(n = n())
+
+ggplot(merged_user_group1, aes(x = month_first_active, y = n, group = year_first_active, color = year_first_active)) +
+  geom_point() +
+  geom_line() +
+  theme_classic() + 
+  xlab("First Active Month") +
+  ylab("Count")
+
+```
+
+From the graph shown above, we can see that from 2009 to 2014, there is an increasing trend in the number of users of Airbnb. And in general, there are more first active users in summer than in winter.
+
+In order to understand the preferences of users of different ages, we decided to categorize age into groups and analyze the preferences of users of different ages for destinations and electronic devices.
+
+```{r,fig.height=10}
+# Clean attribute Age
+merged_user$age[is.na(merged_user$age)] <- -1
+merged_user$age[merged_user$age > 1900] <- 2015 - merged_user$age[merged_user$age > 1900]
+merged_user$age[(merged_user$age < 10) & (merged_user$age >= 0)] <- 0
+merged_user$age[(merged_user$age < 20) & (merged_user$age >= 10)] <- 10
+merged_user$age[(merged_user$age < 30) & (merged_user$age >= 20)] <- 20
+merged_user$age[(merged_user$age < 40) & (merged_user$age >= 30)] <- 30
+merged_user$age[(merged_user$age < 50) & (merged_user$age >= 40)] <- 40
+merged_user$age[(merged_user$age < 60) & (merged_user$age >= 50)] <- 50
+merged_user$age[(merged_user$age < 70) & (merged_user$age >= 60)] <- 60
+merged_user$age[(merged_user$age < 80) & (merged_user$age >= 70)] <- 70
+merged_user$age[(merged_user$age < 90) & (merged_user$age >= 80)] <- 80
+merged_user$age[(merged_user$age < 100) & (merged_user$age >= 90)] <- 90
+merged_user$age[merged_user$age >= 100] <- 100
+merged_user$age[merged_user$age == -1] <- NA
+
+```
+
+```{r,fig.height=10}
+# Make plot of age by destination country
+ggplot(merged_user, aes(x = age , fill = country_destination)) +
+  geom_bar() + 
+  xlab("Age") +
+  ylab("Count")
+
+```
+
+From the graph above, we can see that for all age group, people are more likely to travel within the USA, which is expected because all the users in this dataset are from the USA. In addition, destinations in Europe is more popular in younger generations (20 ~ 40). Lastly, people in age 20 ~ 40 are more likely to travel overall.
+
+
+```{r,fig.height=10}
+# Make plot of gender by destination country
+ggplot(merged_user, aes(x = gender, fill = country_destination)) +
+  geom_bar()+ 
+  xlab("Gender") +
+  ylab("Count")
+```
+
+From the graph above, we can see that people who would rather not to provide their gender are more likely to travel. In addition, females are more likely to travel than males. However, among users who disclosed their gender, there is no big difference in the choice of destination.
+
+```{r,fig.height=10}
+# Make plot of device type by destination country
+ggplot(merged_user, aes(x = first_device_type, fill = country_destination)) +
+  geom_bar() +
+  xlab("First Device Type") +
+  ylab("Count") + 
+  theme(axis.text.x  = element_text(angle=60, hjust=0.5, size=10)) 
+```
+
+It is funny to see from the graph above that people using Android are less likely to travel compared with people using Apple and Windows.
+
+```{r,fig.height=10}
+# Make plot of affiliate provider by destination country
+ggplot(merged_user, aes(x = affiliate_provider, fill = country_destination)) +
+  geom_bar() +
+  coord_flip()+ 
+  xlab("Marketing") +
+  ylab("Count")
+
+```
+
+From the graph above, we can see that people mostly look up and place order directly on Airbnb. The second largest source of visitors is Google.
+
+```{r,fig.height=10}
+# Make vilin plot of age by destination country
+ggplot(merged_user, aes(x = country_destination, y = age, fill = country_destination)) +
+  geom_violin(draw_quantiles = c(.25, .5, .75)) + 
+  xlab("Country Destination") +
+  ylab("Age")
+```
+
+We can see that in addition to domestic travel, young Americans are more likely to travel to Spain, France, Portugal and Netherlands.
+
+
+Next,We divided the target countries and devices into several categories to see the chioces of different genders and ages for these categories.
+
+```{r,add_new_group}
+# Divide countries into four categories
+merged_user$country_category  <- NA
+merged_user$country_category[which(merged_user$country_destination == "NDF")] <- 1
+merged_user$country_category[which(merged_user$country_destination %in% 
+                                        c("US", "CA"))] <- 2
+merged_user$country_category[which(merged_user$country_destination == "other")] <- 3
+merged_user$country_category[which(merged_user$country_destination %in% 
+                          c("AU", "DE", "ES", "FR", "GB", "IT", "NL", "PT"))] <- 4
+merged_user$country_category <- factor(merged_user$country_category, labels = c("None", "NotherAmerica", "Other", "Europe"))
+```
+
+```{r}
+# Divide countries into two categories
+merged_user$country_decision <- NA
+merged_user$country_decision[which(merged_user$country_destination == "NDF")] <- 1
+merged_user$country_decision[which(merged_user$country_destination %in% 
+                          c("US", "CA","AU", "DE", "ES", "FR", "GB", "IT", "NL", "PT", "other"))] <- 2
+merged_user$country_decision <- factor(merged_user$country_decision, labels = c("No", "Yes"))
+
+
+```
+
+```{r}
+# Divide divice type into three categories
+merged_user$device_category <- NA
+merged_user$device_category[which(merged_user$first_device_type %in% 
+                          c("Desktop (Other)", "Mac Desktop", "Windows Desktop"))] <- 1
+merged_user$device_category[which(merged_user$first_device_type %in% c("iPad", "Android Tablet"))] <- 2
+merged_user$device_category[which(merged_user$first_device_type %in% 
+                          c("Android Phone", "iPhone", "SmartPhone (Other)"))] <- 3
+merged_user$device_category <- factor(merged_user$device_category, labels = c("Desktop", "Pad", "SmartPhone"))
+```
+
+```{r,fig.height=10}
+# Make plot of age by country_category
+ggplot(merged_user) +
+  geom_bar(aes(x = age, fill = country_category), position = "dodge") +
+  labs(x = "Age",
+       y = "Frequency",
+       title = "User Distribution of Different Ages by Regions",
+       fill = "country_category") + theme(plot.title = element_text(hjust = 0.5))
+  
+```
+
+We can see that people aged 20-40 are the main force in tourism consumption. Their first choice is domestic travel, followed by going to Europe.
+
+```{r,fig.height=10}
+# Make plot of age by country_decision
+ggplot(merged_user) +
+  geom_bar(aes(x = age, fill = country_decision), position = "dodge") +
+  labs(x = "Age",
+       y = "Frequency",
+       title = "User Distribution of Different Ages for Travel Decision",
+       fill = "country_decision") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+We can see that more than half of Airbnb users eventually booked the room and decided to travel.
+
+```{r,fig.height=10}
+# Make plot of age by device_category
+t = table(merged_user$age, merged_user$device_category) 
+d = as.data.frame(t / rowSums(t))
+names(d) = c("age", "device_category", "Freq")
+print(ggplot(d, aes(age, Freq, fill=device_category)) + geom_bar(stat="identity"))
+```
+
+We can see that the vast majority of users browsed Airbnb information on the desktop.
+
+
+```{r,fig.height=10}
+# Make plot of gender by device_category
+t = table(merged_user$gender, merged_user$device_category) 
+d = as.data.frame(t / rowSums(t))
+names(d) = c("gender", "device_category", "Freq")
+print(ggplot(d, aes(gender, Freq, fill=device_category)) + geom_bar(stat="identity"))
+```
+
+We can see that most of the users prefer to use desktop to browse Airbnb, followed by smartphone, then iPad.
+
+```{r,fig.height=10}
+# Make plot of country_destination
+ggplot(merged_user)+
+     geom_bar(aes(x = country_destination, fill = country_destination))+
+     labs(x="country_destination",
+          y="Count",
+          title="Destination Country")+
+     theme(plot.title = element_text(hjust = 0.5))
+```
+
+From the graph above, we can see that the target variable is highly unbalanced.
+
+
+```{r,fig.height=10}
+# Number of Accounts Created Over Time Across Ages
+train_user$date_account_created <- as.Date(train_user$date_account_created)
+train_2_clean <- train_user[age>=0 & age<=100,]
+heatmapData <- as.matrix(table(train_2_clean$age,train_2_clean$date_account_created)^.2)
+
+qplot(x=Var2, y=Var1, data=melt(heatmapData), fill=value, geom="tile", 
+           xlab = "Date Account Created", ylab = "Age", 
+           main = "Number of Accounts Created Over Time Across Ages") +
+     scale_x_discrete(breaks=levels(as.factor(train_2_clean$date_account_created))[c(TRUE, rep(FALSE, 90))], 
+                          labels=levels(as.factor(train_2_clean$date_account_created))[c(TRUE, rep(FALSE, 90))]) +
+     theme(axis.text.x  = element_text(angle=90, hjust=0.5, size=10)) + 
+     scale_fill_gradient(low="white", high="blue")
+```
+
+From the graph above we can see that more people created their accounts recently, and those who created account are people age from 20 to 35.
+
+```{r,fig.height=10}
+# Make a correlation plot
+plot_correlation(na.omit(merged_user[,1:5]),
+                 title = "Correlation plot for some variables")
+```
+
+We can see that the latitude, longitude and the distance of the destination has positive relationship to customer¡¯s destination. The square of the destination is also valuable  information should be included.
+
+
+
+From the above Exploratory Data Analysis, we can see that there are subtle differences in the choices of destination countries for users of different ages, devices and browsers. Next, we will transpose all the factors into dummy variables and train the model to analyze the user's choice of the destination country.
+
+
+##4. Data transformations
+Prepare the data
+```{r, factor_all_data}
+merged_user$country_destination <- as.factor(merged_user$country_destination)
+merged_user$destination_language<- as.factor(merged_user$destination_language)
+merged_user$gender<- as.factor(merged_user$gender)
+merged_user$id<- as.factor(merged_user$id)
+merged_user$signup_method<- as.factor(merged_user$signup_method)
+merged_user$language<- as.factor(merged_user$language)
+merged_user$affiliate_channel<- as.factor(merged_user$affiliate_channel)
+merged_user$affiliate_provider<- as.factor(merged_user$affiliate_provider)
+merged_user$first_affiliate_tracked<- as.factor(merged_user$first_affiliate_tracked)
+merged_user$signup_app<- as.factor(merged_user$signup_app)
+merged_user$first_device_type<- as.factor(merged_user$first_device_type)
+merged_user$first_browser<- as.factor(merged_user$first_browser)
+merged_user$year_account_created<- as.factor(merged_user$year_account_created)
+merged_user$month_account_created<- as.factor(merged_user$month_account_created)
+merged_user$day_account_created<- as.factor(merged_user$day_account_created)
+merged_user$year_first_active<- as.factor(merged_user$year_first_active)
+merged_user$month_first_active<- as.factor(merged_user$month_first_active)
+merged_user$day_first_active<- as.factor(merged_user$day_first_active)
+merged_user$year_month_account_created  <- as.factor(merged_user$year_month_account_created)
+merged_user$year_month_account_created <- as.factor(merged_user$year_month_account_created)
+merged_user$date_first_active <- as.factor(merged_user$date_first_active)
+```
+
+
+
+```{r, select_data}
+# Select the columns which are to be used in the later analysis
+new_user <- select(merged_user, country_destination, age, id, gender, signup_method, language, affiliate_channel, affiliate_provider, signup_app, first_device_type, first_browser)
+```
+
+```{r, make_cluster}
+new_user[is.na(new_user)] <- -1
+
+
+# Omit NA values in age column
+new_user <- new_user[complete.cases(new_user[ , 2])]
+
+
+# Cluster variables in first_browser column
+new_user$first_browser[new_user$first_browser %in% c("Chrome","Chrome Mobile","Chromium")] <- "Chrome"
+new_user$first_browser[new_user$first_browser %in% c("Firefox","Mobile Firefox","Mozilla")] <- "Firefox"
+new_user$first_browser[new_user$first_browser %in% c("IE","IE Mobile")] <- "IE"
+new_user$first_browser[new_user$first_browser %in% c("Mobile Safari","Safari")] <- "Safari"
+new_user$first_browser[new_user$first_browser %in% c("Opera","Opera Mini","Opera Mobile")] <- "Firefox"
+famousBrowsersSet <- c("Apple Mail", "Arora", "Camino", "CometBird", "Comodo Dragon", "Conkeror", "CoolNovo", "Epic", "Flock","Google Earth", "Googlebot", "IceDragon","IceWeasel", "Iron", "Maxthon", "NetNewsWire", "OmniWeb", "Outlook 2007", "Pale Moon", "RockMelt", "SeaMonkey", "Silk", "SiteKiosk", "Stainless", "TenFourFox")
+new_user$first_browser[(new_user$first_browser %in% famousBrowsersSet)] <- "Other"
+```
+
+```{r, create_dummy_variables}
+# Create dummy variables for those we want to dummify
+catVars <- dummyVars(~ gender + signup_method + language + affiliate_channel + affiliate_provider+ signup_app + first_device_type + first_browser, data = new_user)
+user_dummy <- data.frame(predict(catVars, newdata = new_user))
+```
+
+```{r, combine_data}
+# Combine the dummy variables and those are not dummy variables.
+new_user_not_nominal <- select(new_user, country_destination, age, id)
+new_user <- bind_cols(new_user_not_nominal, user_dummy)
+```
+
+
+## 5. Modeling
+```{r, prepare_data}
+# Split the data into training and validation set.
+set.seed(4500)
+data_split <- initial_split(new_user, strata = "country_destination")
+cs_train <- training(data_split)
+cs_test  <- testing(data_split)
+
+#set.seed(2453)
+#Cv_splits <- vfold_cv(cs_train, v = 10, strata = "country_destination")
+
+classes = cs_train$country_destination
+classes <- as.integer(recode(classes,NDF=0,US=1,other=2,FR=3,CA=4,GB=5,ES=6,IT=7,PT=8,NL=9,DE=10,AU=11))
+
+test_classes = cs_test$country_destination
+test_classes <- as.integer(recode(test_classes,NDF=0,US=1,other=2,FR=3,CA=4,GB=5,ES=6,IT=7,PT=8,NL=9,DE=10,AU=11))
+```
+
+```{r}
+# Drop the original country_destination column
+train_no_id = subset(cs_train, select = -c(country_destination, id))
+test_no_id = subset(cs_test, select = -c(country_destination, id))
+```
+
+```{r}
+train_no_id[is.na(train_no_id)] <- -1
+testtest <- data.matrix(train_no_id)
+```
+
+###1.Extreme Gradient Boosting
+```{r, xgb_model}
+# Make a matrix
+xgb_test_matrix <- xgb.DMatrix(data = as.matrix(test_no_id), label = test_classes)
+```
+
+```{r}
+parallel::detectCores(logical = TRUE)
+set.seed(4500)
+cl <- makeCluster(8)
+registerDoParallel(cl)
+```
+
+
+```{r}
+#Run XGB model
+xgb <- xgboost(data = testtest, 
+               label = classes, 
+               eta = 0.1,
+               max_depth = 9,  
+               nround = 100, 
+               subsample = 0.5,
+               colsample_bytree = 0.5,
+               seed = 1,
+               eval_metric = "merror",
+               objective = "multi:softprob",
+               num_class = 12,
+               nthread = 3
+)
+```
+
+
+```{r}
+model <- xgb.dump(xgb, with_stats = T)
+feature_names <- dimnames(data.matrix(train_no_id))[[2]]
+feature_importance_matrix <- xgb.importance(feature_names, model = xgb)
+print(feature_importance_matrix)
+```
+
+The top 5 factors for deciding which country a user will go to are: age, signup_method.facebook, signup_method.basic, gender.unknown, and signup_app.iOS.
+
+```{r}
+y_pred <- predict(xgb, xgb_test_matrix)
+predictions <- as.data.frame(matrix(y_pred, nrow=12))
+rownames(predictions) <- c('NDF','US','other','FR','CA','GB','ES','IT','PT','NL','DE','AU')
+```
+
+```{r}
+a <- t(predictions)
+```
+
+We extracted the top prediction for each user and created a confusion matrix for our prediction.
+
+```{r}
+# Print model
+u <- union(cs_test$country_destination, as.factor(colnames(a)[apply(a,1,which.max)]))
+t <- table(factor(cs_test$country_destination, u), factor(colnames(a)[apply(a,1,which.max)],u))
+cm_xgb <- confusionMatrix(t)
+cm_xgb
+
+overall3 <- cm_xgb$overall
+overall3.accuracy <- overall3['Accuracy'] 
+
+overall3.kappa <- overall3['Kappa'] 
+
+
+paste("We can see that the accuaracy is", overall3.accuracy, ", and the Kappa value is", overall3.kappa)
+```
+
+###2. Recursive Partitioning
+
+```{r, Recursive_Partitioning}
+# Let's split the data first
+set.seed(4500)
+data_split1 <- initial_split(new_user, strata = "country_destination")
+cs_train1 <- training(data_split1)
+cs_test1  <- testing(data_split1)
+
+# drop the original id column and assign the value -1 to NA
+train_no_id1 = subset(cs_train1, select = -c(id))
+train_no_id1[is.na(train_no_id1)] <- -1
+```
+
+
+```{r, rpart_model}
+# training
+rp_mod <- rpart(
+     country_destination~.,
+     data=train_no_id1, 
+     xval = 10, 
+     method="class")
+
+```
+
+
+```{r}
+# print out the model
+print(rp_mod)
+rp_mod$finalModel
+
+# prediction
+predictions1 <- predict(rp_mod, cs_test1, type = "class")
+
+# Compare predicted outcome with the actual outcome to compute the out-of-sample accuracy of the model
+cm <- confusionMatrix(predictions1, cs_test1$country_destination)
+cm
+overall <- cm$overall
+overall.accuracy <- overall['Accuracy'] 
+
+overall.kappa <- overall['Kappa'] 
+
+
+paste("We can see that the accuracy is", overall.accuracy, ", and the Kappa value is", overall.kappa)
+```
+
+
+###3. Random Forest
+```{r, RF_model}
+# training
+modfit.rf <- randomForest(country_destination ~. , data=train_no_id1)
+
+# prediction
+predictions2 <- predict(modfit.rf, cs_test1, type = "class")
+
+varImpPlot(modfit.rf)
+
+# Compare predicted outcome with the actual outcome to compute the out-of-sample accuracy of the model
+rfc <- confusionMatrix(predictions2, cs_test1$country_destination)
+rfc
+```
+
+```{r}
+overall2 <- rfc$overall
+overall2.accuracy <- overall2['Accuracy'] 
+
+overall2.kappa <- overall2['Kappa'] 
+
+
+paste("We can see that the accuracy is", overall2.accuracy, ", and the Kappa value is", overall2.kappa)
+```
+
+
+Then we compare three models.
+```{r}
+Fianl_Accuracy <- c(overall3.accuracy,overall.accuracy,overall2.accuracy)
+Final_Kappa <- c(overall3.kappa, overall.kappa, overall2.kappa)
+title <- c("XGBoost", "Rpart", "Random Forest")
+r_table <- data.frame("Model" = title, "Accuracy"=Fianl_Accuracy, "Kappa" = Final_Kappa)
+r_table
+```
+
+We can see that Recursive Partitioning has the highest Kappa value, while Extreme Gradient Boosting has the highest accuracy. We pick the model with the highest Kappa value (i.e. rpart) because Kappa takes into account class imbalance. As we can see from the EDA, in our training data, our class is highly imbalanced. So Kappa is a better measure here.
+
+Then we use recursive partitioning to predict test set.
+
+
+##6. Final discussion
+
+# Prediction 
+
+```{r, prediction}
+test_user <- as.data.table(test_user)
+```
+
+```{r, data_prepare}
+# Do the similar preprocess
+test_user$age[is.na(test_user$age)] <- -1
+test_user$age[test_user$age > 1900] <- 2015 - test_user$age[test_user$age > 1900]
+test_user$age[(test_user$age < 10) & (test_user$age >= 0)] <- 0
+test_user$age[(test_user$age < 20) & (test_user$age >= 10)] <- 10
+test_user$age[(test_user$age < 30) & (test_user$age >= 20)] <- 20
+test_user$age[(test_user$age < 40) & (test_user$age >= 30)] <- 30
+test_user$age[(test_user$age < 50) & (test_user$age >= 40)] <- 40
+test_user$age[(test_user$age < 60) & (test_user$age >= 50)] <- 50
+test_user$age[(test_user$age < 70) & (test_user$age >= 60)] <- 60
+test_user$age[(test_user$age < 80) & (test_user$age >= 70)] <- 70
+test_user$age[(test_user$age < 90) & (test_user$age >= 80)] <- 80
+test_user$age[(test_user$age < 100) & (test_user$age >= 90)] <- 90
+test_user$age[test_user$age >= 100] <- 100
+test_user$age[test_user$age == -1] <- NA
+```
+
+```{r}
+test_user$gender<- as.factor(test_user$gender)
+test_user$id<- as.factor(test_user$id)
+test_user$signup_method<- as.factor(test_user$signup_method)
+test_user$language<- as.factor(test_user$language)
+test_user$affiliate_channel<- as.factor(test_user$affiliate_channel)
+test_user$affiliate_provider<- as.factor(test_user$affiliate_provider)
+test_user$first_affiliate_tracked<- as.factor(test_user$first_affiliate_tracked)
+test_user$signup_app<- as.factor(test_user$signup_app)
+test_user$first_device_type<- as.factor(test_user$first_device_type)
+test_user$first_browser<- as.factor(test_user$first_browser)
+
+```
+
+
+```{r}
+# select the columns which are to be used in the later analysis
+new_user2 <- select(test_user, age, id, gender, signup_method, language, affiliate_channel, affiliate_provider, signup_app, first_device_type, first_browser)
+```
+
+```{r}
+new_user2[is.na(new_user2)] <- -1
+
+# omit NA values in age column
+new_user2 <- new_user2[complete.cases(new_user2[ , 2])]
+
+# cluster variables in first_browser column
+new_user2$first_browser[new_user2$first_browser %in% c("Chrome","Chrome Mobile","Chromium")] <- "Chrome"
+new_user2$first_browser[new_user2$first_browser %in% c("Firefox","Mobile Firefox","Mozilla")] <- "Firefox"
+new_user2$first_browser[new_user2$first_browser %in% c("IE","IE Mobile")] <- "IE"
+new_user2$first_browser[new_user2$first_browser %in% c("Mobile Safari","Safari")] <- "Safari"
+new_user2$first_browser[new_user2$first_browser %in% c("Opera","Opera Mini","Opera Mobile")] <- "Firefox"
+famousBrowsersSet <- c("Apple Mail", "Arora", "Camino", "CometBird", "Comodo Dragon", "Conkeror", "CoolNovo", "Epic", "Flock","Google Earth", "Googlebot", "IceDragon","IceWeasel", "Iron", "Maxthon", "NetNewsWire", "OmniWeb", "Outlook 2007", "Pale Moon", "RockMelt", "SeaMonkey", "Silk", "SiteKiosk", "Stainless", "TenFourFox")
+new_user2$first_browser[(new_user2$first_browser %in% famousBrowsersSet)] <- "Other"
+```
+
+```{r}
+# create dummy variables for those we want to dummify
+catVars2 <- dummyVars(~ gender + signup_method + language + affiliate_channel + affiliate_provider+ signup_app + first_device_type + first_browser, data = new_user2)
+user_dummy2 <- data.frame(predict(catVars2, newdata = new_user2))
+```
+
+```{r}
+# combine the dummy variables and those are not dummy variables.
+new_user_not_nominal2 <- select(new_user2, age, id)
+new_user2 <- bind_cols(new_user_not_nominal2, user_dummy2)
+new_user2$id <- NULL
+
+```
+
+```{r}
+new_user2$language.hr <- 0
+new_user2$language.is <- 0
+new_user2$affiliate_channel.api <- 0
+new_user2$affiliate_provider.wayn <- 0
+new_user2$first_browser.Arora <- 0
+new_user2$first_browser.Avant.Browser <- 0
+new_user2$first_browser.Camino <- 0
+new_user2$first_browser.Comodo.Dragon <- 0
+new_user2$first_browser.Conkeror <- 0
+new_user2$first_browser.CoolNovo <- 0
+new_user2$first_browser.Crazy.Browser <- 0
+new_user2$first_browser.Epic <- 0
+new_user2$first_browser.Flock <- 0
+new_user2$first_browser.Google.Earth <- 0
+new_user2$first_browser.Googlebot <- 0
+new_user2$first_browser.IceDragon <- 0
+new_user2$first_browser.Kindle.Browser <- 0
+new_user2$first_browser.Mozilla <- 0
+new_user2$first_browser.NetNewsWire <- 0
+new_user2$first_browser.OmniWeb <- 0
+new_user2$first_browser.Outlook.2007 <- 0 
+new_user2$first_browser.Palm.Pre.web.browser <- 0
+new_user2$first_browser.PS.Vita.browser <- 0
+new_user2$first_browser.RockMelt <- 0
+new_user2$first_browser.SlimBrowser <- 0
+new_user2$first_browser.Stainless <- 0
+new_user2$first_browser.TenFourFox <- 0
+new_user2$first_browser.TheWorld.Browser <- 0
+
+```
+
+
+```{r, predict}
+# prediction
+final_predict <- predict(modfit.rf,newdata = new_user2, type = "class")
+
+final_predict
+```
+
+
+We can see that our prediction results don't give us much information about users' first booking destination since there're only two classes, US and NDF. This means that most of the users will first book a place in the U.S. or they will not book according to our prediction. This is because our data is highly imbalanced, and the classifiers tend to be biased towards the majority class (i.e. US and NDF) and hence perform poorly on the minority class. Besides, we can see that many of the attributes are not useful in training the model, and our raw data is intuitively not very relevant to the results what we need to predict. If the original data contains more variables, such as the user's previous hotel and ticket consumption records, our predicted results will be more accurate. 
+Another reason that may affect our results is that we did not include date-related variables. After research, we found that a large number of users were not recorded for those variables. So if we use them, it will greatly reduce the size of sample we can use.
